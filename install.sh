@@ -46,6 +46,13 @@ VENV_DIR="$SCRIPT_DIR/venv"
 WHISPER_DIR="$SCRIPT_DIR/whisper.cpp"
 MODELS_DIR="$WHISPER_DIR/models"
 ARGOS_PKG_DIR="$HOME/.local/share/argos-translate/packages/translate-en_zh-1_9"
+NLLB_MODEL_DIR="$HOME/.local/share/jt-live-whisper/models/nllb-600m"
+
+# ─── 安裝 Log ─────────────────────────────────────────────
+mkdir -p "$SCRIPT_DIR/logs" 2>/dev/null
+INSTALL_LOG="$SCRIPT_DIR/logs/install_$(date +%Y%m%d_%H%M%S).log"
+# 所有終端機輸出同時寫入 log 檔（tee 複製）
+exec > >(tee -a "$INSTALL_LOG") 2>&1
 
 # 偵測 ARM Homebrew Python（Moonshine 需要 ARM64 原生 Python）
 if [ -x "/opt/homebrew/bin/python3.12" ]; then
@@ -91,6 +98,12 @@ run_spinner() {
     wait "$pid"
     local rc=$?
     printf " \b"
+    # 將指令的詳細輸出寫入安裝 log（畫面上被 spinner 隱藏的部分）
+    if [ -n "$INSTALL_LOG" ] && [ -f "$SPINNER_OUTPUT" ] && [ -s "$SPINNER_OUTPUT" ]; then
+        echo "--- [run_spinner] $msg (rc=$rc) ---" >> "$INSTALL_LOG"
+        cat "$SPINNER_OUTPUT" >> "$INSTALL_LOG"
+        echo "--- [/run_spinner] ---" >> "$INSTALL_LOG"
+    fi
     return $rc
 }
 
@@ -124,7 +137,7 @@ spinner_stop() {
 print_title() {
     echo ""
     echo -e "${C_TITLE}============================================================${NC}"
-    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.1.3 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
+    echo -e "${C_TITLE}${BOLD}  jt-live-whisper v2.7.0 - 100% 全地端 AI 語音工具集 - 安裝程式${NC}"
     echo -e "${C_TITLE}  by Jason Cheng (Jason Tools)${NC}"
     echo -e "${C_TITLE}============================================================${NC}"
     echo ""
@@ -220,9 +233,25 @@ check_running_processes() {
     fi
     if [ "$found" -eq 1 ]; then
         echo ""
-        read -p "  是否仍然繼續安裝？(y/N) " -n 1 -r
+        echo -e "  ${C_WHITE}Y = 繼續安裝（不結束程序）${NC}"
+        echo -e "  ${C_WHITE}K = 強制結束程序後繼續安裝${NC}"
+        echo -e "  ${C_WHITE}N = 取消安裝${NC}"
+        read -p "  請選擇 (y/K/N) " -n 1 -r
         echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        if [[ $REPLY =~ ^[Kk]$ ]]; then
+            pids=$(pgrep -f "whisper-stream" 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+                kill $pids 2>/dev/null || true
+                echo -e "  ${C_DIM}已結束 whisper-stream${NC}"
+            fi
+            pids=$(pgrep -f "translate_meeting.py" 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+                kill $pids 2>/dev/null || true
+                echo -e "  ${C_DIM}已結束 translate_meeting.py${NC}"
+            fi
+            sleep 1
+            check_ok "程序已結束，繼續安裝"
+        elif [[ ! $REPLY =~ ^[Yy]$ ]]; then
             return 1
         fi
     else
@@ -253,7 +282,7 @@ install_brew_formula() {
         check_ok "$desc ($pkg)"
     else
         check_install "正在安裝 $desc ($pkg)..."
-        run_spinner "安裝中..." brew install "$pkg"
+        run_spinner "安裝中..." brew install "$pkg" || true
         if brew list --formula 2>/dev/null | grep -q "^${pkg}$"; then
             echo ""
             check_ok "$desc ($pkg) 安裝完成"
@@ -271,7 +300,15 @@ install_brew_cask() {
         check_ok "$desc ($pkg)"
     else
         check_install "正在安裝 $desc ($pkg)..."
-        run_spinner "安裝中..." brew install --cask "$pkg"
+        if [ "$pkg" = "blackhole-2ch" ]; then
+            # BlackHole 是音訊驅動，需要管理者密碼授權
+            echo ""
+            echo -e "  ${C_WARN}[需要密碼] BlackHole 是虛擬音訊驅動，安裝時 macOS 會要求輸入管理者密碼${NC}"
+            echo ""
+            brew install --cask "$pkg" || true
+        else
+            run_spinner "安裝中..." brew install --cask "$pkg" || true
+        fi
         if brew list --cask 2>/dev/null | grep -q "^${pkg}$"; then
             check_ok "$desc ($pkg) 安裝完成"
             if [ "$pkg" = "blackhole-2ch" ]; then
@@ -313,7 +350,13 @@ check_brew_deps() {
 
 # ─── Python ──────────────────────────────────────
 check_python() {
-    section "Python (ARM64)"
+    local _arch_label
+    if [ "$(uname -m)" = "arm64" ]; then
+        _arch_label="Python (ARM64)"
+    else
+        _arch_label="Python"
+    fi
+    section "$_arch_label"
 
     local is_arm_mac=0
     [ "$(uname -m)" = "arm64" ] && is_arm_mac=1
@@ -359,20 +402,38 @@ check_python() {
         fi
     fi
 
-    # Intel Mac：用一般 Python
+    # Intel Mac：用一般 Python（需要 >= 3.9，ctranslate2 不支援 3.8）
+    local need_py_install=0
     if command -v "$PYTHON_CMD" &>/dev/null; then
-        local ver
-        ver=$("$PYTHON_CMD" --version 2>&1)
-        check_ok "$ver ($PYTHON_CMD)"
-        return 0
+        local py_ver_num
+        py_ver_num=$("$PYTHON_CMD" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
+        local py_minor
+        py_minor=$("$PYTHON_CMD" -c "import sys; print(sys.version_info.minor)" 2>/dev/null)
+        if [ -n "$py_minor" ] && [ "$py_minor" -lt 9 ] 2>/dev/null; then
+            echo -e "  ${C_WARN}[偵測]${NC} $PYTHON_CMD 版本 $py_ver_num 過舊（需要 >= 3.9），嘗試安裝 Python 3.12..."
+            need_py_install=1
+        else
+            local ver
+            ver=$("$PYTHON_CMD" --version 2>&1)
+            check_ok "$ver ($PYTHON_CMD)"
+            return 0
+        fi
     else
+        need_py_install=1
+    fi
+    if [ "$need_py_install" -eq 1 ]; then
         check_install "正在安裝 Python 3.12..."
-        brew install python@3.12
-        if command -v "$PYTHON_CMD" &>/dev/null; then
-            check_ok "Python 3.12 安裝完成"
+        brew install python@3.12 || true
+        if command -v python3.12 &>/dev/null; then
+            PYTHON_CMD="python3.12"
+            check_ok "Python 3.12 安裝完成 ($PYTHON_CMD)"
+            return 0
+        elif [ -x "/usr/local/bin/python3.12" ]; then
+            PYTHON_CMD="/usr/local/bin/python3.12"
+            check_ok "Python 3.12 安裝完成 ($PYTHON_CMD)"
             return 0
         else
-            check_fail "Python 3.12 安裝失敗，請手動安裝"
+            check_fail "Python 3.12 安裝失敗，請手動執行: brew install python@3.12"
             return 1
         fi
     fi
@@ -385,8 +446,8 @@ check_whisper_cpp() {
     # 檢查原始碼
     if [ ! -d "$WHISPER_DIR" ]; then
         check_install "正在下載 whisper.cpp..."
-        run_spinner "下載中..." git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR"
-        if [ $? -eq 0 ]; then
+        run_spinner "下載中..." git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_DIR" || true
+        if [ -d "$WHISPER_DIR" ]; then
             check_ok "whisper.cpp 下載完成"
         else
             check_fail "whisper.cpp 下載失敗"
@@ -413,6 +474,15 @@ check_whisper_cpp() {
         rm -rf "$WHISPER_DIR/build"
         cd "$WHISPER_DIR"
 
+        # 修補 gguf.cpp 缺少 errno 標頭檔（whisper.cpp 上游 bug，新版 clang 會報錯）
+        local _gguf="$WHISPER_DIR/ggml/src/gguf.cpp"
+        if [ -f "$_gguf" ] && ! grep -q '#include <cerrno>' "$_gguf"; then
+            if grep -q 'errno' "$_gguf"; then
+                echo -e "  ${C_DIM}修補 gguf.cpp（加入 #include <cerrno>）${NC}"
+                sed -i.bak '1s/^/#include <cerrno>\n/' "$_gguf"
+            fi
+        fi
+
         # 偵測 SDL 版本（優先 SDL2，未來相容 SDL3）
         local sdl_cmake_flag="-DWHISPER_SDL2=ON"
         local sdl_prefix=""
@@ -434,11 +504,26 @@ check_whisper_cpp() {
             if [ -d "/opt/homebrew/Cellar/sdl2" ] || [ -d "/opt/homebrew/Cellar/sdl3" ]; then
                 cmake_extra_flags="-DCMAKE_OSX_ARCHITECTURES=arm64 -DWHISPER_METAL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.5-a+fp16 -DCMAKE_PREFIX_PATH=/opt/homebrew"
             fi
+        elif [ "$arch" = "x86_64" ]; then
+            # Intel Mac: Homebrew 在 /usr/local，不啟用 Metal（Intel Mac 用 AVX 加速）
+            cmake_extra_flags="-DCMAKE_OSX_ARCHITECTURES=x86_64 -DGGML_METAL=OFF -DCMAKE_PREFIX_PATH=/usr/local"
         fi
 
         local ncpu
         ncpu=$(sysctl -n hw.ncpu)
-        run_spinner "編譯中..." bash -c "cd '$WHISPER_DIR' && cmake -B build $sdl_cmake_flag $cmake_extra_flags 2>&1 && cmake --build build --target whisper-stream -j$ncpu 2>&1"
+        if ! run_spinner "編譯中..." bash -c "cd '$WHISPER_DIR' && cmake -B build $sdl_cmake_flag $cmake_extra_flags 2>&1 && cmake --build build --target whisper-stream -j$ncpu 2>&1"; then
+            echo ""
+            check_fail "whisper.cpp 編譯失敗:"
+            # 從 log 中找實際的編譯器錯誤（error: 開頭的行）
+            local _compiler_errors
+            _compiler_errors=$(grep -i "error:" "$SPINNER_OUTPUT" 2>/dev/null | grep -v "^make" | head -5)
+            if [ -n "$_compiler_errors" ]; then
+                echo -e "  ${C_DIM}${_compiler_errors}${NC}"
+            else
+                echo -e "  ${C_DIM}$(tail -10 "$SPINNER_OUTPUT")${NC}"
+            fi
+            echo -e "  ${C_DIM}完整 log: $SPINNER_OUTPUT${NC}"
+        fi
         echo ""
         cd "$SCRIPT_DIR"
 
@@ -468,16 +553,61 @@ check_whisper_models() {
         fi
     done
 
+    local arch
+    arch=$(uname -m)
     if [ "$has_model" -eq 0 ]; then
-        check_install "正在下載預設模型 (large-v3-turbo，約 809MB)..."
-        cd "$WHISPER_DIR"
-        run_spinner "下載中..." bash models/download-ggml-model.sh large-v3-turbo
-        echo ""
-        cd "$SCRIPT_DIR"
-        if [ -f "$MODELS_DIR/ggml-large-v3-turbo.bin" ]; then
-            check_ok "ggml-large-v3-turbo.bin 下載完成"
+        if [ "$arch" = "x86_64" ]; then
+            # Intel Mac：下載 small.en（適合 Intel CPU，466MB）
+            check_install "正在下載預設模型 (small.en，適合 Intel CPU，約 466MB)..."
+            cd "$WHISPER_DIR"
+            run_spinner "下載中..." bash models/download-ggml-model.sh small.en
+            echo ""
+            cd "$SCRIPT_DIR"
+            if [ -f "$MODELS_DIR/ggml-small.en.bin" ]; then
+                check_ok "ggml-small.en.bin 下載完成"
+            else
+                check_fail "模型下載失敗，請手動下載"
+            fi
         else
-            check_fail "模型下載失敗，請手動下載"
+            # Apple Silicon：下載 large-v3-turbo（有 Metal 加速，809MB）
+            check_install "正在下載預設模型 (large-v3-turbo，約 809MB)..."
+            cd "$WHISPER_DIR"
+            run_spinner "下載中..." bash models/download-ggml-model.sh large-v3-turbo
+            echo ""
+            cd "$SCRIPT_DIR"
+            if [ -f "$MODELS_DIR/ggml-large-v3-turbo.bin" ]; then
+                check_ok "ggml-large-v3-turbo.bin 下載完成"
+            else
+                check_fail "模型下載失敗，請手動下載"
+            fi
+        fi
+    fi
+
+    # Intel Mac：確保有適合的小模型（large-v3-turbo 在 Intel CPU 上太慢）
+    if [ "$arch" = "x86_64" ]; then
+        if [ ! -f "$MODELS_DIR/ggml-small.en.bin" ]; then
+            check_install "Intel CPU 建議使用 small.en 模型，正在下載（約 466MB）..."
+            cd "$WHISPER_DIR"
+            run_spinner "下載中..." bash models/download-ggml-model.sh small.en
+            echo ""
+            cd "$SCRIPT_DIR"
+            if [ -f "$MODELS_DIR/ggml-small.en.bin" ]; then
+                check_ok "ggml-small.en.bin 下載完成"
+            else
+                check_fail "small.en 下載失敗（可在程式啟動時選擇下載）"
+            fi
+        fi
+        if [ ! -f "$MODELS_DIR/ggml-base.en.bin" ]; then
+            check_install "正在下載 base.en 模型（最快速，約 142MB）..."
+            cd "$WHISPER_DIR"
+            run_spinner "下載中..." bash models/download-ggml-model.sh base.en
+            echo ""
+            cd "$SCRIPT_DIR"
+            if [ -f "$MODELS_DIR/ggml-base.en.bin" ]; then
+                check_ok "ggml-base.en.bin 下載完成"
+            else
+                check_fail "base.en 下載失敗（可在程式啟動時選擇下載）"
+            fi
         fi
     fi
 }
@@ -524,7 +654,14 @@ check_venv() {
 
     local missing_pkgs=()
     if ! python3 -c "import ctranslate2" &>/dev/null 2>&1; then
-        missing_pkgs+=("ctranslate2")
+        # Intel Mac (x86_64) 只有 ctranslate2 <= 4.3.1 有預建 wheel
+        local arch
+        arch=$(uname -m)
+        if [ "$arch" = "x86_64" ]; then
+            missing_pkgs+=("ctranslate2==4.3.1")
+        else
+            missing_pkgs+=("ctranslate2")
+        fi
     fi
     if ! python3 -c "import sentencepiece" &>/dev/null 2>&1; then
         missing_pkgs+=("sentencepiece")
@@ -536,7 +673,19 @@ check_venv() {
         missing_pkgs+=("sounddevice")
     fi
     if ! python3 -c "import numpy" &>/dev/null 2>&1; then
-        missing_pkgs+=("numpy")
+        # Intel Mac (x86_64)：ctranslate2==4.3.1 編譯時用 NumPy 1.x，與 NumPy 2.x 不相容
+        if [ "$(uname -m)" = "x86_64" ]; then
+            missing_pkgs+=("numpy<2")
+        else
+            missing_pkgs+=("numpy")
+        fi
+    elif [ "$(uname -m)" = "x86_64" ]; then
+        # Intel Mac：已裝 NumPy 但若為 2.x 需降級（ctranslate2==4.3.1 不相容）
+        local np_major
+        np_major=$(python3 -c "import numpy; print(numpy.__version__.split('.')[0])" 2>/dev/null)
+        if [ "$np_major" = "2" ]; then
+            missing_pkgs+=("numpy<2")
+        fi
     fi
     if ! python3 -c "import faster_whisper" &>/dev/null 2>&1; then
         missing_pkgs+=("faster-whisper")
@@ -546,28 +695,79 @@ check_venv() {
         if ! python3 -c "import pkg_resources" &>/dev/null 2>&1; then
             pip install --quiet --disable-pip-version-check "setuptools<81" 2>&1 | tail -1
         fi
+        # resemblyzer → librosa → numba → llvmlite
+        # 先確保 llvmlite/numba 有預建 wheel 的版本，避免 source build 失敗
+        if ! python3 -c "import numba" &>/dev/null 2>&1; then
+            pip install --quiet --disable-pip-version-check --only-binary=:all: "llvmlite" "numba" 2>/dev/null || true
+        fi
         missing_pkgs+=("resemblyzer")
     fi
     if ! python3 -c "import spectralcluster" &>/dev/null 2>&1; then
         missing_pkgs+=("spectralcluster")
     fi
 
+    # 套件中文說明對照（pip 套件名 → 說明）
+    _pkg_label() {
+        case "$1" in
+            ctranslate2*)              echo "ctranslate2（語音辨識加速引擎）" ;;
+            sentencepiece)             echo "sentencepiece（分詞工具）" ;;
+            opencc-python-reimplemented) echo "OpenCC（簡繁轉換）" ;;
+            sounddevice)               echo "sounddevice（音訊擷取）" ;;
+            numpy*)                    echo "numpy（數值計算）" ;;
+            faster-whisper)            echo "faster-whisper（離線語音辨識）" ;;
+            resemblyzer)               echo "resemblyzer（講者辨識 - 聲紋提取）" ;;
+            spectralcluster)           echo "spectralcluster（講者辨識 - 分群）" ;;
+            *)                         echo "$1" ;;
+        esac
+    }
+    # import 名稱 → 說明
+    _import_label() {
+        case "$1" in
+            ctranslate2)    echo "ctranslate2（語音辨識加速引擎）" ;;
+            sentencepiece)  echo "sentencepiece（分詞工具）" ;;
+            opencc)         echo "OpenCC（簡繁轉換）" ;;
+            sounddevice)    echo "sounddevice（音訊擷取）" ;;
+            numpy)          echo "numpy（數值計算）" ;;
+            faster_whisper) echo "faster-whisper（離線語音辨識）" ;;
+            resemblyzer)    echo "resemblyzer（講者辨識 - 聲紋提取）" ;;
+            spectralcluster) echo "spectralcluster（講者辨識 - 分群）" ;;
+            *)              echo "$1" ;;
+        esac
+    }
+
     if [ ${#missing_pkgs[@]} -gt 0 ]; then
-        check_install "正在安裝 Python 套件: ${missing_pkgs[*]}..."
-        run_spinner "安裝中..." pip install --quiet --disable-pip-version-check "${missing_pkgs[@]}"
-        echo ""
+        check_install "正在安裝 ${#missing_pkgs[@]} 個 Python 套件..."
+        # 逐個安裝，避免單一套件失敗導致全部取消
+        for pkg in "${missing_pkgs[@]}"; do
+            local label
+            label="$(_pkg_label "$pkg")"
+            if ! run_spinner "$label ..." pip install --disable-pip-version-check "$pkg"; then
+                echo ""
+                check_fail "$label 安裝失敗:"
+                echo -e "  ${C_DIM}$(grep -i 'error' "$SPINNER_OUTPUT" 2>/dev/null | grep -v "^make" | tail -3)${NC}"
+                echo ""
+            else
+                echo ""
+            fi
+        done
         # 驗證（用 import 名稱，不是 pip 套件名稱）
         local all_ok=1
         for pkg in ctranslate2 sentencepiece opencc sounddevice numpy faster_whisper resemblyzer spectralcluster; do
+            local label
+            label="$(_import_label "$pkg")"
             if python3 -c "import $pkg" &>/dev/null 2>&1; then
-                check_ok "Python 套件: $pkg"
+                check_ok "$label"
             else
-                check_fail "Python 套件: $pkg 安裝失敗"
+                check_fail "$label 安裝失敗"
                 all_ok=0
             fi
         done
     else
-        check_ok "Python 套件: ctranslate2, sentencepiece, opencc, sounddevice, numpy, faster-whisper, resemblyzer, spectralcluster"
+        for pkg in ctranslate2 sentencepiece opencc sounddevice numpy faster_whisper resemblyzer spectralcluster; do
+            local label
+            label="$(_import_label "$pkg")"
+            check_ok "${label}（已安裝）"
+        done
     fi
 
     deactivate
@@ -583,7 +783,11 @@ check_moonshine() {
         check_ok "moonshine-voice 已安裝"
     else
         check_install "正在安裝 moonshine-voice..."
-        run_spinner "安裝中..." pip install --quiet --disable-pip-version-check moonshine-voice
+        if ! run_spinner "安裝中..." pip install --disable-pip-version-check moonshine-voice; then
+            echo ""
+            check_fail "moonshine-voice 安裝失敗:"
+            echo -e "  ${C_DIM}$(tail -5 "$SPINNER_OUTPUT")${NC}"
+        fi
         echo ""
         if python3 -c "from moonshine_voice import get_model_for_language" &>/dev/null 2>&1; then
             check_ok "moonshine-voice 安裝完成"
@@ -637,7 +841,11 @@ check_argos_model() {
         check_install "正在下載 Argos 翻譯模型..."
         # 使用 argos-translate Python 套件來安裝模型
         source "$VENV_DIR/bin/activate"
-        run_spinner "安裝套件..." pip install --quiet --disable-pip-version-check argostranslate
+        if ! run_spinner "安裝套件..." pip install --disable-pip-version-check argostranslate; then
+            echo ""
+            check_fail "argostranslate 安裝失敗:"
+            echo -e "  ${C_DIM}$(tail -5 "$SPINNER_OUTPUT")${NC}"
+        fi
         echo ""
         run_spinner "下載模型..." python3 -c "
 from argostranslate import package
@@ -675,6 +883,38 @@ else:
     fi
 }
 
+# ─── NLLB 翻譯模型 ──────────────────────────────
+check_nllb_model() {
+    section "NLLB 離線翻譯模型（中日英互譯，CC-BY-NC 4.0 授權）"
+
+    if [ -d "$NLLB_MODEL_DIR" ] && [ -f "$NLLB_MODEL_DIR/model.bin" ] && \
+       [ -f "$NLLB_MODEL_DIR/sentencepiece.bpe.model" ]; then
+        check_ok "NLLB 模型已安裝 ($NLLB_MODEL_DIR)"
+    else
+        check_install "正在下載 NLLB 600M 模型（約 600MB）..."
+        source "$VENV_DIR/bin/activate"
+        # 確保 huggingface_hub 已安裝
+        pip install --disable-pip-version-check -q huggingface_hub 2>/dev/null
+        mkdir -p "$NLLB_MODEL_DIR"
+        echo ""
+        run_spinner "下載模型..." python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('JustFrederik/nllb-200-distilled-600M-ct2-int8',
+                  local_dir='$NLLB_MODEL_DIR')
+print('OK')
+"
+        echo ""
+        deactivate
+
+        if [ -f "$NLLB_MODEL_DIR/model.bin" ]; then
+            check_ok "NLLB 模型安裝完成"
+        else
+            check_fail "NLLB 模型下載失敗"
+            echo -e "  ${C_DIM}  請確認網路連線後重新執行安裝${NC}"
+        fi
+    fi
+}
+
 # ─── 升級 ────────────────────────────────────────
 do_upgrade() {
     section "從 GitHub 升級程式"
@@ -696,7 +936,7 @@ do_upgrade() {
         return 1
     fi
 
-    # 取得遠端版本號
+    # 取得伺服器版本號
     local remote_version
     remote_version=$(grep -m1 'APP_VERSION' "$tmp_dir/repo/translate_meeting.py" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
     local local_version
@@ -710,7 +950,7 @@ do_upgrade() {
         return 0
     fi
 
-    # 比較版本號：若遠端比本地舊，不蓋過（開發機本地可能比 GitHub 新）
+    # 比較版本號：若伺服器比本地舊，不蓋過（開發機本地可能比 GitHub 新）
     _ver_gt() {
         # 回傳 0 表示 $1 > $2（版本號比較）
         [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ] && [ "$1" != "$2" ]
@@ -1022,9 +1262,9 @@ print('ok')
     return 0
 }
 
-# ─── 遠端 GPU Whisper 伺服器（選填）──────────────
+# ─── GPU 伺服器 Whisper 伺服器（選填）──────────────
 setup_remote_whisper() {
-    section "遠端 GPU 語音辨識伺服器（非必要，若未裝則用本機進行語音辨識）"
+    section "GPU 伺服器 語音辨識伺服器（非必要，若未裝則用本機進行語音辨識）"
 
     # 使用 venv Python 讀寫 config（避免依賴系統 python3）
     local _PY="$VENV_DIR/bin/python3"
@@ -1047,7 +1287,21 @@ if os.path.isfile(p):
         existing_key=$("$_PY" -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('ssh_key',''))" 2>/dev/null)
         existing_wport=$("$_PY" -c "import json; rw=json.load(open('$SCRIPT_DIR/config.json'))['remote_whisper']; print(rw.get('whisper_port',8978))" 2>/dev/null)
 
-        echo -e "  ${C_WHITE}已有遠端設定: ${existing_user}@${existing_host}:${existing_port}${NC}"
+        echo -e "  ${C_WHITE}已有伺服器設定: ${existing_user}@${existing_host}:${existing_port}${NC}"
+
+        # 檢查 SSH key 是否存在，不存在則自動產生
+        if [ -n "$existing_key" ] && [ ! -f "$existing_key" ]; then
+            echo -e "  ${C_WARN}[提醒]${NC} 設定的 SSH Key 不存在: ${existing_key}"
+            echo -e "  ${C_DIM}  自動產生 SSH Key...${NC}"
+            mkdir -p "$(dirname "$existing_key")"
+            ssh-keygen -t ed25519 -f "$existing_key" -N "" -q
+            if [ -f "$existing_key" ]; then
+                check_ok "SSH Key 已產生: ${existing_key}"
+            else
+                echo -e "  ${C_WARN}[提醒]${NC} SSH Key 產生失敗，將使用密碼認證"
+                existing_key=""
+            fi
+        fi
 
         # 組合 SSH（含 ControlMaster）
         local ctrl_sock="/tmp/jt-ssh-cm-${existing_user}@${existing_host}:${existing_port}"
@@ -1062,7 +1316,7 @@ if os.path.isfile(p):
         local gpu_info="" cuda_check="" pt_ok="" ct2_ok="" ow_ok=""
 
         # 背景 spinner + 輸出緩衝（SSH 檢查需時數秒）
-        spinner_start "正在檢查遠端環境"
+        spinner_start "正在檢查伺服器環境"
         {
             # 1. SSH 連線
             if ssh $chk_opts "$existing_user@$existing_host" "echo ok" &>/dev/null; then
@@ -1175,16 +1429,16 @@ print(f'{pt},{ct2},{ow}')
                     echo -e "  ${C_DIM}未偵測到 NVIDIA GPU（將以 CPU 辨識）${NC}"
                 fi
 
-                # 7. 遠端磁碟空間（非阻斷，僅提示）
+                # 7. 伺服器磁碟空間（非阻斷，僅提示）
                 local remote_avail_mb
                 remote_avail_mb=$(ssh $chk_opts "$existing_user@$existing_host" "df -m ~ | awk 'NR==2{print \$4}'" 2>/dev/null)
                 if [ -n "$remote_avail_mb" ] && [ "$remote_avail_mb" -gt 0 ] 2>/dev/null; then
                     local remote_avail_gb
                     remote_avail_gb=$(awk "BEGIN{printf \"%.1f\", $remote_avail_mb/1024}")
                     if [ "$remote_avail_mb" -lt 5000 ]; then
-                        echo -e "  ${C_WARN}[警告]${NC} 遠端磁碟空間偏低（${remote_avail_gb} GB 可用）"
+                        echo -e "  ${C_WARN}[警告]${NC} 伺服器磁碟空間偏低（${remote_avail_gb} GB 可用）"
                     else
-                        check_ok "遠端磁碟空間 ${remote_avail_gb} GB 可用"
+                        check_ok "伺服器磁碟空間 ${remote_avail_gb} GB 可用"
                     fi
                 fi
             else
@@ -1213,7 +1467,7 @@ print(f'{pt},{ct2},{ow}')
                 if ! ssh $chk_opts "$existing_user@$existing_host" "grep -qF '$(cat "${existing_key}.pub")' ~/.ssh/authorized_keys 2>/dev/null"; then
                     ssh $chk_opts "$existing_user@$existing_host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" < "${existing_key}.pub"
                     if [ $? -eq 0 ]; then
-                        check_ok "SSH 公鑰已加入遠端，日後免密碼"
+                        check_ok "SSH 公鑰已加入伺服器，日後免密碼"
                     fi
                 fi
             fi
@@ -1271,26 +1525,28 @@ else:
 \"
             " 2>&1 | grep -v "^Shared connection"
             check_ok "辨識模型檢查完成"
-            # 同步部署最新 server.py
-            local scp_chk_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -P $existing_port"
-            scp_chk_opts="$scp_chk_opts -o ControlMaster=auto -o ControlPath=$ctrl_sock -o ControlPersist=120"
-            if [ -n "$existing_key" ]; then
-                scp_chk_opts="$scp_chk_opts -i $existing_key"
-            fi
-            local local_hash remote_hash
-            local_hash=$(md5 -q "$SCRIPT_DIR/remote_whisper_server.py" 2>/dev/null || md5sum "$SCRIPT_DIR/remote_whisper_server.py" 2>/dev/null | cut -d' ' -f1)
-            remote_hash=$(ssh $chk_opts "$existing_user@$existing_host" "md5sum ~/jt-whisper-server/server.py 2>/dev/null | cut -d' ' -f1" 2>/dev/null)
-            if [ "$local_hash" != "$remote_hash" ]; then
-                scp $scp_chk_opts "$SCRIPT_DIR/remote_whisper_server.py" "$existing_user@$existing_host:~/jt-whisper-server/server.py" &>/dev/null
-                if [ $? -eq 0 ]; then
-                    # 重啟遠端伺服器以載入新版程式
-                    ssh $chk_opts "$existing_user@$existing_host" "pkill -f 'server.py --port' 2>/dev/null" &>/dev/null || true
-                    check_ok "server.py 已同步更新（已重啟遠端伺服器，執行程式時自動載入新版）"
+            # 同步部署最新 server.py（僅本地有此檔案時）
+            if [ -f "$SCRIPT_DIR/remote_whisper_server.py" ]; then
+                local scp_chk_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -P $existing_port"
+                scp_chk_opts="$scp_chk_opts -o ControlMaster=auto -o ControlPath=$ctrl_sock -o ControlPersist=120"
+                if [ -n "$existing_key" ] && [ -f "$existing_key" ]; then
+                    scp_chk_opts="$scp_chk_opts -i $existing_key"
+                fi
+                local local_hash remote_hash
+                local_hash=$(md5 -q "$SCRIPT_DIR/remote_whisper_server.py" 2>/dev/null || md5sum "$SCRIPT_DIR/remote_whisper_server.py" 2>/dev/null | cut -d' ' -f1)
+                remote_hash=$(ssh $chk_opts "$existing_user@$existing_host" "md5sum ~/jt-whisper-server/server.py 2>/dev/null | cut -d' ' -f1" 2>/dev/null)
+                if [ "$local_hash" != "$remote_hash" ]; then
+                    scp $scp_chk_opts "$SCRIPT_DIR/remote_whisper_server.py" "$existing_user@$existing_host:~/jt-whisper-server/server.py" &>/dev/null
+                    if [ $? -eq 0 ]; then
+                        # 重啟伺服器以載入新版程式
+                        ssh $chk_opts "$existing_user@$existing_host" "pkill -f 'server.py --port' 2>/dev/null" &>/dev/null || true
+                        check_ok "server.py 已同步更新（已重啟伺服器，執行程式時自動載入新版）"
+                    fi
                 fi
             fi
             # 關閉 SSH 多工
             ssh -o ControlPath="$ctrl_sock" -O exit "$existing_user@$existing_host" &>/dev/null || true
-            check_ok "遠端 GPU 辨識環境正常（${existing_user}@${existing_host}）"
+            check_ok "GPU 伺服器 辨識環境正常（${existing_user}@${existing_host}）"
             return 0
         fi
 
@@ -1300,7 +1556,7 @@ else:
         # 需要修復
         echo ""
         echo -e "  ${C_WARN}偵測到問題:${repair_items}${NC}"
-        echo -ne "  ${C_WHITE}是否修復遠端環境？(Y/n): ${NC}"
+        echo -ne "  ${C_WHITE}是否修復伺服器環境？(Y/n): ${NC}"
         read -r do_repair
         if [[ "$do_repair" =~ ^[Nn]$ ]]; then
             echo -e "  ${C_DIM}跳過修復${NC}"
@@ -1315,15 +1571,15 @@ else:
         local rw_port="$existing_wport"
     else
         # 沒有設定，問要不要新設
-        echo -e "  ${C_WHITE}若有 Linux + NVIDIA GPU 伺服器，可部署遠端 Whisper 辨識服務，大幅加快語音辨識速度${NC}"
+        echo -e "  ${C_WHITE}若有 Linux + NVIDIA GPU 伺服器，可部署伺服器 Whisper 辨識服務，大幅加快語音辨識速度${NC}"
         echo -e "  ${C_DIM}離線處理音訊檔（--input）時速度快 5-10 倍${NC}"
         echo -e "  ${C_DIM}支援系統：DGX OS / Ubuntu（需有 NVIDIA 驅動與 CUDA）${NC}"
         echo -e "  ${C_DIM}不設定則使用本機 CPU 辨識${NC}"
         echo ""
-        echo -ne "  ${C_WHITE}是否設定遠端 GPU 辨識？(y/N): ${NC}"
+        echo -ne "  ${C_WHITE}是否設定GPU 伺服器 辨識？(y/N): ${NC}"
         read -r setup_remote
         if [[ ! "$setup_remote" =~ ^[Yy]$ ]]; then
-            echo -e "  ${C_DIM}跳過遠端設定${NC}"
+            echo -e "  ${C_DIM}跳過伺服器設定${NC}"
             return 0
         fi
 
@@ -1369,7 +1625,7 @@ else:
     local ctrl_sock="/tmp/jt-ssh-cm-${rw_user}@${rw_host}:${rw_ssh_port}"
     local ssh_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -p $rw_ssh_port"
     ssh_opts="$ssh_opts -o ControlMaster=auto -o ControlPath=$ctrl_sock -o ControlPersist=120"
-    if [ -n "$rw_key" ]; then
+    if [ -n "$rw_key" ] && [ -f "$rw_key" ]; then
         ssh_opts="$ssh_opts -i $rw_key"
     fi
 
@@ -1394,14 +1650,14 @@ else:
         if ! ssh $ssh_opts "$rw_user@$rw_host" "grep -qF '$(cat "${rw_key}.pub")' ~/.ssh/authorized_keys 2>/dev/null"; then
             ssh $ssh_opts "$rw_user@$rw_host" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" < "${rw_key}.pub"
             if [ $? -eq 0 ]; then
-                check_ok "SSH 公鑰已加入遠端，日後免密碼"
+                check_ok "SSH 公鑰已加入伺服器，日後免密碼"
             fi
         else
             check_ok "SSH 免密碼登入已設定"
         fi
     fi
 
-    # 檢查遠端 Python3 + ffmpeg + 編譯工具
+    # 檢查伺服器 Python3 + ffmpeg + 編譯工具
     local need_apt=""
     if ! ssh $ssh_opts "$rw_user@$rw_host" "command -v python3" &>/dev/null; then
         need_apt="python3 python3-venv python3-pip"
@@ -1421,10 +1677,10 @@ else:
         fi
     done
     if [ -n "$need_apt" ]; then
-        check_install "遠端缺少:${need_apt}，正在安裝..."
+        check_install "伺服器缺少:${need_apt}，正在安裝..."
         if ! run_spinner "安裝中..." ssh $ssh_opts "$rw_user@$rw_host" "apt update -qq && apt install -y -qq $need_apt"; then
             echo ""
-            check_fail "無法在遠端安裝系統套件"
+            check_fail "無法在伺服器安裝系統套件"
             _cleanup_ssh_cm
             return 1
         fi
@@ -1432,25 +1688,25 @@ else:
     fi
     check_ok "Python3 + ffmpeg + 編譯工具就緒"
 
-    # 檢查遠端磁碟空間
+    # 檢查伺服器磁碟空間
     local remote_avail_mb
     remote_avail_mb=$(ssh $ssh_opts "$rw_user@$rw_host" "df -m ~ | awk 'NR==2{print \$4}'" 2>/dev/null)
     if [ -n "$remote_avail_mb" ] && [ "$remote_avail_mb" -gt 0 ] 2>/dev/null; then
         local remote_avail_gb
         remote_avail_gb=$(awk "BEGIN{printf \"%.1f\", $remote_avail_mb/1024}")
         if [ "$remote_avail_mb" -lt 5000 ]; then
-            check_fail "遠端磁碟空間不足：可用 ${remote_avail_gb} GB，最小需要 5 GB"
-            echo -e "  ${C_DIM}遠端 GPU 伺服器需要安裝 PyTorch (~2.5GB) + Whisper 模型 (~6GB)${NC}"
+            check_fail "伺服器磁碟空間不足：可用 ${remote_avail_gb} GB，最小需要 5 GB"
+            echo -e "  ${C_DIM}GPU 伺服器需要安裝 PyTorch (~2.5GB) + Whisper 模型 (~6GB)${NC}"
             _cleanup_ssh_cm
             return 1
         elif [ "$remote_avail_mb" -lt 12000 ]; then
-            echo -e "  ${C_WARN}[注意]${NC} 遠端可用空間 ${remote_avail_gb} GB（完整安裝需 12 GB）"
+            echo -e "  ${C_WARN}[注意]${NC} 伺服器可用空間 ${remote_avail_gb} GB（完整安裝需 12 GB）"
         else
-            check_ok "遠端磁碟空間充足（${remote_avail_gb} GB 可用）"
+            check_ok "伺服器磁碟空間充足（${remote_avail_gb} GB 可用）"
         fi
     fi
 
-    # 檢查遠端 NVIDIA GPU + CUDA
+    # 檢查伺服器 NVIDIA GPU + CUDA
     local remote_gpu_name
     remote_gpu_name=$(ssh $ssh_opts "$rw_user@$rw_host" "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1" 2>/dev/null)
     local torch_index=""
@@ -1520,7 +1776,7 @@ else:
     fi
 
     # 安裝其他套件
-    check_install "安裝遠端 Python 套件..."
+    check_install "安裝伺服器 Python 套件..."
     # 檢查是否有原始碼編譯的 CTranslate2 快取 wheel（aarch64 CUDA）
     local ct2_cached_whl=""
     ct2_cached_whl=$(ssh $ssh_opts "$rw_user@$rw_host" "ls ~/jt-whisper-server/.ct2-wheels/ctranslate2-*.whl 2>/dev/null | head -1" 2>/dev/null)
@@ -1549,12 +1805,12 @@ else:
     fi
     if [ $? -ne 0 ]; then
         echo ""
-        check_fail "遠端套件安裝失敗"
+        check_fail "伺服器套件安裝失敗"
         _cleanup_ssh_cm
         return 1
     fi
     echo ""
-    check_ok "遠端 Python 套件安裝完成"
+    check_ok "伺服器 Python 套件安裝完成"
 
     # 驗證 CUDA（PyTorch + CTranslate2）
     if [ -n "$torch_index" ]; then
@@ -1608,7 +1864,7 @@ print(f'{pt},{ct2}')
     # SCP 部署 server.py（ControlMaster 也適用於 scp）
     local scp_opts="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -P $rw_ssh_port"
     scp_opts="$scp_opts -o ControlMaster=auto -o ControlPath=$ctrl_sock -o ControlPersist=120"
-    if [ -n "$rw_key" ]; then
+    if [ -n "$rw_key" ] && [ -f "$rw_key" ]; then
         scp_opts="$scp_opts -i $rw_key"
     fi
     if ! scp $scp_opts "$SCRIPT_DIR/remote_whisper_server.py" "$rw_user@$rw_host:~/jt-whisper-server/server.py" &>/dev/null; then
@@ -1638,7 +1894,7 @@ print(f'{pt},{ct2}')
         done
         return $ok
     }
-    run_spinner "測試啟動遠端伺服器..." _test_health
+    run_spinner "測試啟動伺服器..." _test_health
     local health_ok=$?
 
     # 停止測試 server
@@ -1646,11 +1902,11 @@ print(f'{pt},{ct2}')
 
     if [ "$health_ok" -eq 0 ]; then
         echo ""
-        check_ok "遠端伺服器測試成功"
+        check_ok "伺服器測試成功"
     else
         echo ""
-        check_fail "遠端伺服器無法啟動，請檢查防火牆或 GPU 驅動"
-        echo -e "  ${C_DIM}可查看遠端 log: ssh $rw_user@$rw_host cat /tmp/jt-whisper-server.log${NC}"
+        check_fail "伺服器無法啟動，請檢查防火牆或 GPU 驅動"
+        echo -e "  ${C_DIM}可查看伺服器 log: ssh $rw_user@$rw_host cat /tmp/jt-whisper-server.log${NC}"
         _cleanup_ssh_cm
         return 1
     fi
@@ -1727,27 +1983,178 @@ print('  config.json 已更新')
     check_ok "設定已儲存至 config.json"
 }
 
+# ─── 驗證安裝結果 ────────────────────────────────
+verify_installation() {
+    section "驗證安裝結果"
+
+    local verify_failed=0
+
+    # Python venv
+    if [ -f "$VENV_DIR/bin/python3" ]; then
+        check_ok "Python 虛擬環境"
+    else
+        check_fail "Python 虛擬環境"
+        ((verify_failed++)) || true
+    fi
+
+    source "$VENV_DIR/bin/activate" 2>/dev/null
+
+    # 核心套件
+    local verify_modules=(
+        "numpy|numpy（數值計算）"
+        "ctranslate2|ctranslate2（語音辨識加速）"
+        "sentencepiece|sentencepiece（分詞工具）"
+        "faster_whisper|faster-whisper（離線辨識）"
+        "resemblyzer|resemblyzer（講者辨識）"
+        "spectralcluster|spectralcluster（講者分群）"
+        "sounddevice|sounddevice（音訊擷取）"
+        "argos_check|Argos Translate（離線翻譯）"
+        "opencc|OpenCC（簡繁轉換）"
+    )
+
+    for item in "${verify_modules[@]}"; do
+        local mod="${item%%|*}"
+        local desc="${item#*|}"
+        if [ "$mod" = "argos_check" ]; then
+            # Argos: 檢查模型目錄（translate_meeting.py 有 fallback 不需 pip 套件）
+            local _argos_found
+            _argos_found=$(find "$HOME/.local/share/argos-translate/packages" -maxdepth 1 -name "translate-en_zh*" -type d 2>/dev/null | head -1)
+            if [ -n "$_argos_found" ]; then
+                check_ok "$desc"
+            else
+                check_fail "$desc"
+                ((verify_failed++)) || true
+            fi
+        elif python3 -c "import $mod" &>/dev/null 2>&1; then
+            check_ok "$desc"
+        else
+            check_fail "$desc"
+            ((verify_failed++)) || true
+        fi
+    done
+
+    # Moonshine
+    if python3 -c "from moonshine_voice import get_model_for_language" &>/dev/null 2>&1; then
+        check_ok "Moonshine（英文低延遲 ASR）"
+    else
+        echo -e "  ${C_DIM}[略過]${NC} Moonshine 未安裝（選裝，不影響主要功能）"
+    fi
+
+    # whisper.cpp
+    if [ -x "$WHISPER_DIR/build/bin/whisper-stream" ]; then
+        check_ok "whisper.cpp（本機即時辨識）"
+    else
+        echo -e "  ${C_DIM}[略過]${NC} whisper.cpp 未安裝（離線模式、Moonshine、GPU 伺服器不受影響）"
+    fi
+
+    # ffmpeg
+    if command -v ffmpeg &>/dev/null; then
+        check_ok "ffmpeg（音訊轉檔）"
+    else
+        check_fail "ffmpeg 未安裝（處理非 WAV 音訊時需要）"
+        ((verify_failed++)) || true
+    fi
+
+    deactivate 2>/dev/null
+    _VERIFY_FAILED=$verify_failed
+}
+
 # ─── 總結 ────────────────────────────────────────
 print_summary() {
+    _VERIFY_FAILED=0
+    verify_installation
+    local verify_failed=$_VERIFY_FAILED
+
     echo ""
     echo -e "${C_TITLE}============================================================${NC}"
-    echo -e "${C_TITLE}${BOLD}  安裝結果${NC}"
+    if [ "$verify_failed" -eq 0 ] 2>/dev/null; then
+        echo -e "${C_OK}${BOLD}  安裝完成！${NC}"
+    else
+        echo -e "${C_WARN}${BOLD}  安裝完成（${verify_failed} 個元件未安裝，詳見上方提示）${NC}"
+    fi
     echo -e "${C_TITLE}============================================================${NC}"
-    echo ""
-    echo -e "  ${C_OK}通過: $passed${NC}"
-    [ "$installed" -gt 0 ] && echo -e "  ${C_WARN}新安裝: $installed${NC}"
-    [ "$failed" -gt 0 ] && echo -e "  ${C_ERR}失敗: $failed${NC}"
     echo ""
 
-    if [ "$failed" -gt 0 ]; then
-        echo -e "  ${C_ERR}有 $failed 個項目安裝失敗，請查看上方訊息修正後重新執行。${NC}"
-        echo ""
-        exit 1
+    # 功能對照表
+    source "$VENV_DIR/bin/activate" 2>/dev/null
+
+    echo -e "  ${C_WHITE}可用功能：${NC}"
+
+    # faster-whisper
+    if python3 -c "import faster_whisper" &>/dev/null 2>&1; then
+        echo -e "  ${C_OK}■${NC} 離線音訊處理 (--input)  ${C_DIM}faster-whisper${NC}"
     else
-        echo -e "  ${C_OK}${BOLD}全部就緒！可以執行 ./start.sh 啟動系統。${NC}"
-        echo ""
-        echo -e "  ${C_DIM}提示：若日後將此資料夾搬移到其他位置，請重新執行 ./install.sh${NC}"
-        echo -e "  ${C_DIM}      安裝程式會自動偵測並修復因路徑變更而損壞的環境${NC}"
+        echo -e "  ${C_DIM}□ 離線音訊處理 (--input)  faster-whisper${NC}"
+    fi
+
+    # resemblyzer
+    if python3 -c "import resemblyzer" &>/dev/null 2>&1; then
+        echo -e "  ${C_OK}■${NC} AI 講者辨識 (--diarize)  ${C_DIM}resemblyzer${NC}"
+    else
+        echo -e "  ${C_DIM}□ AI 講者辨識 (--diarize)  resemblyzer${NC}"
+    fi
+
+    # Argos（檢查模型目錄而非 pip 套件）
+    local _argos_pkg_dir="$HOME/.local/share/argos-translate/packages"
+    if [ -d "$_argos_pkg_dir" ] && find "$_argos_pkg_dir" -maxdepth 1 -name "translate-en_zh*" -type d 2>/dev/null | grep -q .; then
+        echo -e "  ${C_OK}■${NC} Argos 離線翻譯  ${C_DIM}僅英翻中${NC}"
+    else
+        echo -e "  ${C_DIM}□ Argos 離線翻譯  僅英翻中${NC}"
+    fi
+
+    # NLLB
+    local nllb_dir="$HOME/.local/share/jt-live-whisper/models/nllb-600m"
+    if [ -f "$nllb_dir/model.bin" ]; then
+        echo -e "  ${C_OK}■${NC} NLLB 離線翻譯  ${C_DIM}中日英互譯${NC}"
+    else
+        echo -e "  ${C_DIM}□ NLLB 離線翻譯  中日英互譯${NC}"
+    fi
+
+    # Moonshine
+    if python3 -c "from moonshine_voice import get_model_for_language" &>/dev/null 2>&1; then
+        echo -e "  ${C_OK}■${NC} Moonshine 即時辨識  ${C_DIM}英文低延遲${NC}"
+    else
+        echo -e "  ${C_DIM}□ Moonshine 即時辨識  英文低延遲${NC}"
+    fi
+
+    # whisper.cpp
+    if [ -x "$WHISPER_DIR/build/bin/whisper-stream" ]; then
+        echo -e "  ${C_OK}■${NC} Whisper 本機即時辨識  ${C_DIM}whisper.cpp${NC}"
+    else
+        echo -e "  ${C_DIM}□ Whisper 本機即時辨識  whisper.cpp${NC}"
+    fi
+
+    # GPU 伺服器
+    local rw_host=""
+    if [ -f "$SCRIPT_DIR/config.json" ]; then
+        rw_host=$(python3 -c "
+import json
+try:
+    cfg = json.load(open('$SCRIPT_DIR/config.json'))
+    print(cfg.get('remote_whisper',{}).get('host',''))
+except: pass
+" 2>/dev/null)
+    fi
+    if [ -n "$rw_host" ]; then
+        echo -e "  ${C_OK}■${NC} GPU 伺服器 ($rw_host)  ${C_DIM}remote whisper server${NC}"
+    else
+        echo -e "  ${C_DIM}□ GPU 伺服器 辨識  remote whisper server${NC}"
+    fi
+
+    deactivate 2>/dev/null
+
+    echo ""
+    echo -e "  ${C_WHITE}CPU 模式${NC}"
+    echo -e "  ${C_DIM}建議搭配區域網路 LLM 伺服器使用（--llm-host）${NC}"
+    echo ""
+    echo -e "  ${C_WHITE}啟動方式: ${C_OK}./start.sh${NC}"
+    echo -e "  ${C_WHITE}升級方式: ${C_OK}./install.sh --upgrade${NC}"
+    echo ""
+    echo -e "  ${C_DIM}提示：若日後將此資料夾搬移到其他位置，請重新執行 ./install.sh${NC}"
+    echo -e "  ${C_DIM}      安裝程式會自動偵測並修復因路徑變更而損壞的環境${NC}"
+    echo ""
+    if [ -n "$INSTALL_LOG" ] && [ -f "$INSTALL_LOG" ]; then
+        echo -e "  ${C_DIM}安裝 log: $INSTALL_LOG${NC}"
         echo ""
     fi
 }
@@ -1811,5 +2218,6 @@ check_whisper_models
 check_venv
 check_moonshine
 check_argos_model
+check_nllb_model
 setup_remote_whisper
 print_summary
