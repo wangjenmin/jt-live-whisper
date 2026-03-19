@@ -487,21 +487,29 @@ cd C:\jt-live-whisper
 
 | 參數 | 說明 | 預設值 |
 |------|------|--------|
+| `--webui` | 啟動 WebUI 瀏覽器介面 | |
 | `--mode MODE` | 功能模式 (`en2zh` / `zh2en` / `ja2zh` / `zh2ja` / `en_zh` / `ja_zh` / `en` / `zh` / `ja` / `record`) | `en2zh` |
-| `--asr ASR` | AI 語音辨識引擎 (whisper / moonshine) | whisper |
-| `-m`, `--model MODEL` | Whisper 模型 | large-v3-turbo |
-| `--engine ENGINE` | 翻譯引擎 (llm / nllb / argos，llm 支援 Ollama 及 OpenAI 相容伺服器) | llm |
-| `--llm-model MODEL` | LLM 翻譯模型 | qwen2.5:14b |
-| `--llm-host HOST` | LLM 伺服器位址 | 無（需設定） |
-| `--topic TOPIC` | 會議主題（提升翻譯品質） | |
-| `--summary-model MODEL` | 摘要用 LLM 模型 | gpt-oss:120b |
-| `--input FILE [...]` | 離線處理音訊檔（配對檔案自動合併處理；單檔時自動偵測同時間戳配對） | |
-| `--diarize` | 啟用講者辨識 | |
-| `--num-speakers N` | 指定講者人數 | 自動偵測 |
-| `--summarize [FILE ...]` | 生成 AI 摘要 | |
+| `--asr ASR` | 語音辨識引擎 (`whisper` / `moonshine` / `faster-whisper`) | `whisper` |
+| `-m`, `--model MODEL` | Whisper 模型 (`base.en` / `small.en` / `small` / `medium.en` / `medium` / `large-v3-turbo` / `large-v3`) | 依裝置推薦 |
+| `--moonshine-model MODEL` | Moonshine 模型 (`medium` / `small` / `tiny`) | `medium` |
+| `-s`, `--scene SCENE` | 使用場景 (`meeting` / `training` / `presentation` / `subtitle`) | `training` |
+| `-e`, `--engine ENGINE` | 翻譯引擎 (`llm` / `nllb` / `argos`) | `llm` |
+| `--llm-model MODEL` | LLM 翻譯模型 | `qwen2.5:14b` |
+| `--llm-host HOST` | LLM 伺服器位址（自動偵測 Ollama 或 OpenAI 相容） | |
+| `--topic TOPIC` | 會議主題（提升翻譯與摘要品質） | |
+| `-d`, `--device ID` | 音訊裝置 ID（可用 `--list-devices` 查詢） | 自動偵測 |
+| `--list-devices` | 列出可用音訊裝置後離開 | |
+| `--input FILE [...]` | 離線處理音訊檔 | |
+| `--diarize` | 啟用講者辨識（需搭配 `--input`） | |
+| `--num-speakers N` | 指定講者人數（需搭配 `--diarize`） | 自動偵測 |
+| `--summarize [FILE ...]` | 生成 AI 摘要（與 `--input` 合用時不需指定檔案） | |
+| `--summary-model MODEL` | 摘要用 LLM 模型 | `gpt-oss:120b` |
 | `--mic` | 同時轉錄麥克風語音（即時模式） | |
 | `--record` | 即時模式同時錄製音訊 | |
+| `--rec-device ID` | 錄音裝置 ID（可與辨識裝置不同） | |
+| `--denoise` | 即時模式啟用背景降噪 | |
 | `--local-asr` | 強制使用本機辨識（忽略 GPU 伺服器設定） | |
+| `--restart-server` | 強制重啟 GPU 伺服器 | |
 
 &nbsp;
 

@@ -439,11 +439,12 @@ WebUI 需要 fastapi、uvicorn、websockets 套件（安裝腳本已自動安裝
 | 參數 | 說明 | 預設值 |
 |---|---|---|
 | `-h`, `--help` | 顯示說明 | |
+| `--webui` | 啟動 WebUI 瀏覽器介面（在瀏覽器中操作所有功能） | |
 | `--mode MODE` | 功能模式 (`en2zh` / `zh2en` / `ja2zh` / `zh2ja` / `en_zh` / `ja_zh` / `en` / `zh` / `ja` / `record`) | `en2zh` |
-| `--asr ASR` | 語音辨識引擎 (whisper / moonshine) | whisper |
+| `--asr ASR` | 語音辨識引擎 (`whisper` / `moonshine` / `faster-whisper`) | `whisper` |
 | `-m`, `--model MODEL` | Whisper 模型 (large-v3-turbo / large-v3 / small / medium / small.en / base.en / medium.en) | `en2zh`: large-v3-turbo / 中日文+有GPU: large-v3-turbo / 中日文+無GPU: small |
 | `--moonshine-model MODEL` | Moonshine 模型 (medium / small / tiny) | medium |
-| `-s`, `--scene SCENE` | 使用場景 (meeting / training / subtitle)，僅 Whisper 即時模式 | training |
+| `-s`, `--scene SCENE` | 使用場景 (`meeting` / `training` / `presentation` / `subtitle`)，僅 Whisper 即時模式 | `training` |
 | `--topic TOPIC` | 會議主題（提升翻譯品質，例：`--topic 'ZFS 儲存管理'`）。僅翻譯模式有效 | |
 | `-d`, `--device ID` | 音訊裝置 ID (數字) | 自動偵測 BlackHole (macOS) / WASAPI Loopback (Windows) |
 | `-e`, `--engine ENGINE` | 翻譯引擎 (llm / argos / nllb) | llm |
@@ -458,6 +459,7 @@ WebUI 需要 fastapi、uvicorn、websockets 套件（安裝腳本已自動安裝
 | `--summarize [FILE ...]` | 摘要模式：讀取記錄檔生成摘要（與 --input 合用時不需指定檔案） | |
 | `--summary-model MODEL` | 摘要用的 LLM 模型 | gpt-oss:120b |
 | `--mic` | 同時轉錄麥克風語音（即時模式，ASR 負載加倍，見下方說明） | 不啟用 |
+| `--denoise` | 即時模式啟用背景降噪（推薦搭配麥克風使用） | 不啟用 |
 | `--local-asr` | 強制使用本機辨識（忽略 GPU 伺服器設定，即時與離線模式皆適用） | |
 | `--restart-server` | 強制重啟 GPU 伺服器（更新 server.py 後使用） | |
 
